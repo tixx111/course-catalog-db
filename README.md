@@ -21,6 +21,47 @@ psql -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f queries
 
 The password `change-me` is for teaching; real projects keep passwords out of git.
 
+## Schema
+
+```mermaid
+erDiagram
+    COURSES ||--o{ ENROLLMENTS : "course enrollments"
+    STUDENTS ||--o{ ENROLLMENTS : "student enrollments"
+
+    COURSES {
+        text id PK "course slug"
+        text title
+        text description
+        integer credits
+        boolean is_elective
+        integer likes
+    }
+
+    STUDENTS {
+        bigint id PK
+        text name
+        text email UK
+    }
+
+    ENROLLMENTS {
+        bigint id PK
+        text course_id FK
+        bigint student_id FK
+        timestamptz enrolled_at
+    }
+```
+
+The database schema models an academic course catalog comprising three relational tables: `courses`, `students`, and `enrollments`. The domain exhibits a many-to-many relationship between students and courses, as a student can register for multiple courses and a course can be attended by multiple students. This many-to-many relationship is normalized through the `enrollments` junction table, which associates student records with course records via foreign keys while ensuring each student can enroll in a given course at most once.
+
+## Design decisions
+
+- **Why `courses.id` is `text` (a slug) while `students.id` is an automatic number:**
+  A slug identifier (e.g. `modern-frontend`) for courses provides clean, human-readable, and SEO-friendly RESTful API endpoints (`/courses/modern-frontend`) without requiring an extra slug column or index lookup. The disadvantage is that text keys consume more storage in foreign key references and indexes, and changing a course slug requires updating all referencing foreign keys. For students, names and emails can change, so a surrogate integer key (`bigint GENERATED ALWAYS AS IDENTITY`) provides a stable, compact (8 bytes), high-performance numeric identifier that never changes and simplifies index operations and joins.
+- **Why `RESTRICT` on `enrollments.course_id` but `CASCADE` on `enrollments.student_id`:**
+  A course is a central organizational unit; deleting a course while students are actively enrolled could silently delete student enrollment histories, transcripts, and financial/audit records. Using `ON DELETE RESTRICT` guards against accidental catalog deletions by requiring enrollments to be explicitly unassigned or archived first. On the other hand, if a student account is removed (for example, account deletion or GDPR request), their individual enrollments become obsolete and should be automatically pruned via `ON DELETE CASCADE` to prevent orphaned enrollment records.
+- **Why `timestamptz` and not `timestamp`, and why `text` and not `varchar(n)`:**
+  `timestamptz` (`timestamp with time zone`) stores the point in time in UTC internally and converts to/from client session time zones cleanly. Using `timestamp` without timezone loses timezone context and leads to timezone ambiguities across clients and servers. In PostgreSQL, `text` and `varchar` use identical internal representation (`varlena`) with identical performance; arbitrary length limits like `varchar(255)` introduce maintenance friction when valid inputs exceed the length, whereas explicit `CHECK` constraints (e.g. `CHECK (length(name) >= 2)`) allow precise business rule validation without locking types.
+
 ## Constraint violation log
 
 Commands were run with `\set VERBOSITY verbose`.
@@ -95,3 +136,14 @@ Scenario: enroll a new student in a course — two inserts in one transaction.
 - Window B saw `0` before COMMIT (changes made inside an active transaction are isolated and invisible to concurrent sessions under PostgreSQL's default `read committed` isolation level) and `1` after COMMIT (both rows became visible atomically).
 - What would have happened without a transaction if the second insert had failed? Without a transaction (or under autocommit mode), each SQL statement runs as its own standalone transaction. The first insert would have permanently committed the student `Madina Ospanova` to the `students` table, while the second insert would fail. The database would be left in an inconsistent "half an operation" state containing an orphaned student who is enrolled in zero courses.
 
+## Self-review against the checklist
+
+| What to check | Result | Comment |
+|---------------|--------|---------|
+| Keys | Yes | Every table has a primary key (`courses.id`, `students.id`, `enrollments.id`), and `enrollments` has foreign keys referencing `courses(id)` and `students(id)`. |
+| Types | Yes | Types match semantics: course slugs are `text`, numeric surrogate IDs are `bigint`, timestamps use `timestamptz`, numbers are `integer`, and booleans are `boolean`. |
+| Required values | Yes | All columns across all three tables are `NOT NULL`, guaranteeing that required attributes are never NULL. |
+| Constraints | Yes | Domain rules are enforced via `CHECK (credits > 0)`, `CHECK (likes >= 0)`, `CHECK (length(name) >= 2)`, `UNIQUE (email)`, and composite `UNIQUE (course_id, student_id)`, aligning with Pydantic validations. |
+| Deletion | Yes | `ON DELETE RESTRICT` protects courses from accidental deletion while active enrollments exist; `ON DELETE CASCADE` automatically purges enrollments when a student is deleted. |
+| Normalization | Yes | The schema is in 3NF: course details are stored once in `courses`, student details once in `students`, and the junction table `enrollments` models the M:N relationship with no duplicate attribute lists. |
+| Indexes and names | Yes | All identifiers use consistent snake_case naming; foreign key `student_id` is indexed with `enrollments_student_id_idx` to accelerate lookups and cascading operations; no redundant indexes exist. |
