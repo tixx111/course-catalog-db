@@ -87,3 +87,11 @@ Answers to the questions:
    - Looking up all enrollments of a specific student (`SELECT * FROM enrollments WHERE student_id = 777;`), which is used when viewing a student's profile or enrolled courses.
    - Deleting or updating a student with cascading foreign keys (`DELETE FROM students WHERE id = 777;`), where the engine must locate and remove matching child rows from `enrollments`.
 
+## Transaction
+
+Scenario: enroll a new student in a course — two inserts in one transaction.
+
+- The second insert failed: psql showed `ERROR: 23503: insert or update on table "enrollments" violates foreign key constraint "enrollments_course_id_fkey"` with detail `Key (course_id)=(no-such-course) is not present in table "courses"`. The transaction entered the aborted state (`course_catalog=!>`), rejecting any further queries. Running `ROLLBACK;` cancelled the transaction completely, undoing the first insert as well: Madina was not added to the `students` table (`count = 0`).
+- Window B saw `0` before COMMIT (changes made inside an active transaction are isolated and invisible to concurrent sessions under PostgreSQL's default `read committed` isolation level) and `1` after COMMIT (both rows became visible atomically).
+- What would have happened without a transaction if the second insert had failed? Without a transaction (or under autocommit mode), each SQL statement runs as its own standalone transaction. The first insert would have permanently committed the student `Madina Ospanova` to the `students` table, while the second insert would fail. The database would be left in an inconsistent "half an operation" state containing an orphaned student who is enrolled in zero courses.
+
