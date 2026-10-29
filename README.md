@@ -147,3 +147,63 @@ Scenario: enroll a new student in a course — two inserts in one transaction.
 | Deletion | Yes | `ON DELETE RESTRICT` protects courses from accidental deletion while active enrollments exist; `ON DELETE CASCADE` automatically purges enrollments when a student is deleted. |
 | Normalization | Yes | The schema is in 3NF: course details are stored once in `courses`, student details once in `students`, and the junction table `enrollments` models the M:N relationship with no duplicate attribute lists. |
 | Indexes and names | Yes | All identifiers use consistent snake_case naming; foreign key `student_id` is indexed with `enrollments_student_id_idx` to accelerate lookups and cascading operations; no redundant indexes exist. |
+
+## Bonus tasks
+
+### Task 1. Normalization: three anomalies of a flat table
+
+Using the unnormalized flat table `registrations` in `norm_demo` (`experiments/norm_demo.sql`), three classic relational anomalies were observed:
+
+1. **Update anomaly:** Changing the title of `modern-frontend` in a single row (`UPDATE registrations SET course_title = ... WHERE student_name = 'Daniyar Bekov' AND course_id = 'modern-frontend'`) left other rows with the old title. The database ended up storing two inconsistent course titles for the same course.
+2. **Delete anomaly:** Deleting the single enrollment for `backend-fastapi` (`DELETE FROM registrations WHERE student_name = 'Daniyar Bekov' AND course_id = 'backend-fastapi'`) deleted the course information itself entirely. The catalog lost knowledge that the course ever existed.
+3. **Insert anomaly:** Adding a newly created course with zero enrolled students (`web-security`) required inserting an empty or NULL student (`student_name = NULL`), because course data could only be represented inside an enrollment row.
+
+**How normalization fixes each:**
+Splitting into three tables (`courses`, `students`, `enrollments`) isolates distinct entities:
+- Course titles and credits are stored exactly once in `courses`, so an update only modifies one row (eliminating update anomalies).
+- Courses exist independently in `courses`, so deleting an enrollment does not delete the course itself (eliminating delete anomalies).
+- A new course can be inserted into `courses` without needing any student or enrollment record (eliminating insert anomalies).
+
+### Task 2. Lost update and row-level locking
+
+When two concurrent sessions execute the "read — compute in code — write back" pattern:
+1. Session A reads `likes = 11`.
+2. Session B reads `likes = 11`.
+3. Session A updates `likes = 12`.
+4. Session B updates `likes = 12`.
+
+One like is lost because Session B wrote back stale state based on its earlier read.
+
+In contrast, performing the atomic increment inside the query (`UPDATE courses SET likes = likes + 1 WHERE id = 'api-design'`):
+PostgreSQL locks the row for update (`FOR UPDATE`). When Session A begins an update in an active transaction, Session B's concurrent update blocks and waits. When Session A commits, Session B's query evaluates the *newly committed version* of the row, seeing `likes = 12` and successfully incrementing it to `13`. Neither update is lost.
+
+### Task 3. Parameterized queries vs string concatenation
+
+When query strings are constructed using string interpolation or concatenation:
+```sql
+SELECT id, title FROM courses WHERE id = 'x' OR '1'='1';
+```
+The untrusted input `'x' OR '1'='1'` alters the query's AST (abstract syntax tree). The parser treats `OR '1'='1'` as SQL operators, making the `WHERE` condition unconditionally true for every row in the table, leaking all courses or allowing authentication bypass.
+
+With prepared/parameterized queries:
+```sql
+PREPARE by_id (text) AS SELECT id, title FROM courses WHERE id = $1;
+EXECUTE by_id('x'' OR ''1''=''1');
+```
+The query syntax is parsed and compiled *before* parameter binding. The parameter value is treated strictly as a literal data scalar (string constant) and passed directly to the execution engine. Any quotation marks or SQL syntax inside the argument are treated as literal characters within the slug, not executable tokens, making SQL injection impossible.
+
+### Task 4. Two more queries: courses without enrollments and HAVING
+
+Added to `queries.sql`:
+- **Query 7 (Courses without enrollments):** Uses `LEFT JOIN enrollments e ON e.course_id = c.id WHERE e.id IS NULL ORDER BY c.id;` to find courses with no matching enrollment row.
+- **Query 8 (Students in multiple courses):** Uses `GROUP BY s.id, s.name HAVING count(*) > 1 ORDER BY courses DESC, s.name;` to aggregate courses per student and filter aggregated groups.
+
+### Task 5. Live schema evolution: ALTER TABLE
+
+Added the email format validation rule without data loss or table recreation:
+```sql
+ALTER TABLE students
+ADD CONSTRAINT students_email_format CHECK (position('@' IN email) > 1);
+```
+PostgreSQL validates existing table rows before applying the constraint. Any subsequent insert with an invalid email address (e.g. `'no-at-sign'`) is rejected with `ERROR: 23514 (check constraint "students_email_format")`. The constraint was also incorporated into `schema.sql`.
+

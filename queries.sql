@@ -77,3 +77,22 @@ FROM courses c
 LEFT JOIN enrollments e ON e.course_id = c.id
 GROUP BY c.id
 ORDER BY enrolled DESC, c.id;
+
+-- 7. courses without enrollments (Bonus Task 4)
+-- ids of the courses nobody is enrolled in, in alphabetical order
+SELECT c.id
+FROM courses c
+LEFT JOIN enrollments e ON e.course_id = c.id
+WHERE e.id IS NULL
+ORDER BY c.id;
+
+-- 8. students with more than one course (Bonus Task 4)
+-- a student's name and the number of their courses (AS courses),
+-- for students enrolled in more than one course; those with more courses first
+SELECT s.name, count(*) AS courses
+FROM students s
+JOIN enrollments e ON e.student_id = s.id
+GROUP BY s.id, s.name
+HAVING count(*) > 1
+ORDER BY courses DESC, s.name;
+
