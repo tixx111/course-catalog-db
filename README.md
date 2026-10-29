@@ -42,3 +42,48 @@ Commands were run with `\set VERBOSITY verbose`.
 ### Why check in the database if there is already a check in Pydantic?
 
 Pydantic performs input validation at the FastAPI boundary, rejecting invalid payloads early with friendly client messages. However, the database is the single source of truth and final line of defense. The API is rarely the only client touching the database: direct SQL scripts, data migrations (Alembic), administrative consoles, and background workers can all write to PostgreSQL directly. Enforcing constraints at the database level guarantees data integrity regardless of how or by whom data is inserted.
+
+## Index: EXPLAIN before and after
+
+Query: `SELECT * FROM enrollments WHERE student_id = 777;`
+Database idx_demo: 500 courses, 20,000 students, 50,000 enrollments.
+
+| | Before the index | After the index |
+|---|------------------|-----------------|
+| Access method | Seq Scan | Bitmap Heap Scan / Bitmap Index Scan |
+| cost | 0.00..1042.00 | 4.31..15.59 |
+| Rows Removed by Filter | 49997 | 0 (none) |
+| Execution Time | 4.858 ms | 0.007 ms |
+
+```text
+-- Before index
+Seq Scan on enrollments  (cost=0.00..1042.00 rows=3 width=34) (actual time=0.097..4.846 rows=3 loops=1)
+  Filter: (student_id = 777)
+  Rows Removed by Filter: 49997
+Planning Time: 0.062 ms
+Execution Time: 4.858 ms
+```
+
+```text
+-- After index
+Bitmap Heap Scan on enrollments  (cost=4.31..15.59 rows=3 width=34) (actual time=0.003..0.004 rows=3 loops=1)
+  Recheck Cond: (student_id = 777)
+  Heap Blocks: exact=3
+  ->  Bitmap Index Scan on enrollments_student_id_idx  (cost=0.00..4.31 rows=3 width=0) (actual time=0.002..0.002 rows=3 loops=1)
+        Index Cond: (student_id = 777)
+Planning Time: 0.012 ms
+Execution Time: 0.007 ms
+```
+
+Answers to the questions:
+
+1. **Why didn't PostgreSQL create an index on `enrollments.student_id`, although there are indexes on `email` and `course_id`?**
+   PostgreSQL automatically creates unique B-tree indexes only for `PRIMARY KEY` and `UNIQUE` constraints (such as `students_email_key` and the composite `enrollments_course_id_student_id_key`). The composite index on `(course_id, student_id)` can only accelerate queries filtering by `course_id` (the first column in the composite index) or both columns together; it cannot be used for searches on `student_id` alone. PostgreSQL never creates indexes automatically for `FOREIGN KEY` constraints, so foreign key indexes must be created explicitly.
+
+2. **Why does a primary-key lookup on `courses` (six rows) use `Seq Scan`, while on `enrollments` (50 thousand rows) it goes through an index?**
+   The PostgreSQL cost-based query planner estimates the total cost of reading pages and processing rows. The `courses` table contains only 6 rows, fitting entirely on a single 8KB disk page. Reading that single page sequentially (cost ~1.07) is faster than traversing index tree pages and then reading the table heap page. On the other hand, `enrollments` has 50,000 rows spread across many pages; scanning all 50,000 rows costs 1042.00 arbitrary units and discards 49,997 rows, whereas index lookup costs only ~15.59. The planner chooses `Seq Scan` whenever it is cheaper than index access.
+
+3. **Name two operations that an index on `student_id` will speed up:**
+   - Looking up all enrollments of a specific student (`SELECT * FROM enrollments WHERE student_id = 777;`), which is used when viewing a student's profile or enrolled courses.
+   - Deleting or updating a student with cascading foreign keys (`DELETE FROM students WHERE id = 777;`), where the engine must locate and remove matching child rows from `enrollments`.
+
